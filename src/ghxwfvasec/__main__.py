@@ -1,229 +1,291 @@
-import argparse
-import os
+import json
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List
 
+import click
 import yaml
-from github import Github
+
+# --- SCANNER LOGIC ---
 
 
-class WorkflowAuditor:
+class WorkflowScanner:
     def __init__(self):
-        # Regex to find secrets.NAME or vars.NAME
-        # Catches: ${{ secrets.MY_SECRET }}, secrets.MY_SECRET (in if clauses), etc.
+        # Regex to catch: secrets.NAME, vars.NAME, ${{ secrets.NAME }}
         self.pattern = re.compile(r"\b(secrets|vars)\.([a-zA-Z0-9_-]+)\b")
         self.results = {}
         self.global_usage = {"secrets": set(), "vars": set()}
 
-    def _extract_from_string(self, text: str) -> None:
+    def _extract_from_string(self, text: str, file_refs: Dict[str, set]) -> None:
         matches = self.pattern.findall(text)
         for context, name in matches:
-            # Skip built-in GITHUB_TOKEN if you prefer, usually valid to keep
             self.global_usage[context].add(name)
-            self.current_file_refs[context].add(name)
+            file_refs[context].add(name)
 
-    def _walk_node(self, node: Any) -> None:
-        """Recursively walk the YAML tree to find strings."""
+    def _walk_node(self, node: Any, file_refs: Dict[str, set]) -> None:
         if isinstance(node, dict):
             for value in node.values():
-                self._walk_node(value)
+                self._walk_node(value, file_refs)
         elif isinstance(node, list):
             for item in node:
-                self._walk_node(item)
+                self._walk_node(item, file_refs)
         elif isinstance(node, str):
-            self._extract_from_string(node)
+            self._extract_from_string(node, file_refs)
 
-    def parse_file(self, file_path: Path) -> None:
+    def scan_file(self, file_path: Path) -> None:
         try:
             with open(file_path, "r", encoding="utf-8") as f:
-                # We load the YAML to avoid parsing commented-out code
                 data = yaml.safe_load(f)
 
             if not data:
                 return
 
-            self.current_file_refs = {"secrets": set(), "vars": set()}
-            self._walk_node(data)
+            file_refs = {"secrets": set(), "vars": set()}
+            self._walk_node(data, file_refs)
 
-            self.results[file_path.name] = self.current_file_refs
+            # Only store if something was found
+            if file_refs["secrets"] or file_refs["vars"]:
+                self.results[file_path.name] = file_refs
 
-        except Exception as e:
-            print(f"Error parsing {file_path}: {e}", file=sys.stderr)
+        except Exception:
+            # Ignore invalid yaml or read errors
+            pass
 
-    def scan_path(self, path: str) -> None:
-        p = Path(path)
+    def scan_path(self, path: Path) -> None:
         files = []
-        if p.is_file():
-            files = [p]
-        elif p.is_dir():
-            # valid extensions for GH workflows
-            files = list(p.glob("**/*.yml")) + list(p.glob("**/*.yaml"))
+        if path.is_file():
+            files = [path]
+        elif path.is_dir():
+            files = list(path.glob("**/*.yml")) + list(path.glob("**/*.yaml"))
 
-        for f in files:
-            self.parse_file(f)
+        with click.progressbar(files, label="Scanning Workflow Files") as bar:
+            for f in bar:
+                self.scan_file(f)
 
 
-class GithubConnector:
-    def __init__(self, token: str, repo_name: str):
-        self.g = Github(token)
+# --- GITHUB CLI INTEGRATION ---
+
+
+class GHInspector:
+    def __init__(self, repo: str = None):
+        if not shutil.which("gh"):
+            raise click.ClickException(
+                "GitHub CLI ('gh') not found. Please install it."
+            )
+
+        self.repo_arg = ["-R", repo] if repo else []
+        self._check_auth()
+
+    def _check_auth(self):
         try:
-            self.repo = self.g.get_repo(repo_name)
-        except Exception as e:
-            print(f"Error connecting to repo {repo_name}: {e}")
-            sys.exit(1)
+            subprocess.run(["gh", "auth", "status"], check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            raise click.ClickException(
+                "You are not logged into gh CLI. Run 'gh auth login'."
+            )
 
-    def fetch_definitions(self):
-        print(f"Connecting to GitHub Repo: {self.repo.full_name}...")
+    def _run_json(self, cmd: List[str]) -> Any:
+        full_cmd = ["gh"] + cmd + self.repo_arg + ["--json", "name"]
+        try:
+            res = subprocess.run(full_cmd, capture_output=True, text=True, check=True)
+            return json.loads(res.stdout)
+        except subprocess.CalledProcessError:
+            return []
 
-        # 1. Repo Secrets
-        repo_secrets = set(s.name for s in self.repo.get_secrets())
+    def fetch_data(self):
+        click.echo("🔄 Fetching definitions from GitHub...")
 
-        # 2. Repo Variables
-        repo_vars = set(v.name for v in self.repo.get_variables())
+        # Repo level
+        repo_secrets = set(x["name"] for x in self._run_json(["secret", "list"]))
+        repo_vars = set(x["name"] for x in self._run_json(["variable", "list"]))
 
-        # 3. Environment Secrets/Vars (Optional: Loop through environments)
+        # Environment level
         envs = {}
-        for env in self.repo.get_environments():
-            e_secrets = set(s.name for s in env.get_secrets())
-            e_vars = set(v.name for v in env.get_variables())
-            envs[env.name] = {"secrets": e_secrets, "vars": e_vars}
+        # Fetch env list via API
+        api_cmd = (
+            ["gh", "api"]
+            + self.repo_arg
+            + ["repos/:owner/:repo/environments", "--jq", ".environments[].name"]
+        )
+        res = subprocess.run(api_cmd, capture_output=True, text=True)
+
+        if res.returncode == 0 and res.stdout.strip():
+            env_names = res.stdout.strip().split("\n")
+            for env in env_names:
+                if not env:
+                    continue
+                e_secrets = set(
+                    x["name"] for x in self._run_json(["secret", "list", "--env", env])
+                )
+                e_vars = set(
+                    x["name"]
+                    for x in self._run_json(["variable", "list", "--env", env])
+                )
+                envs[env] = {"secrets": e_secrets, "vars": e_vars}
 
         return {"repo_secrets": repo_secrets, "repo_vars": repo_vars, "envs": envs}
 
 
-def generate_report(
-    auditor: WorkflowAuditor, gh_data: dict = None, output_file: str = None
-):
+# --- REPORTING ---
+
+
+def generate_output(scanner, gh_data):
+    """Generates a list of strings for the report."""
     lines = []
 
-    def add(line=""):
-        print(line)
-        lines.append(line)
+    def h1(text):
+        lines.append(f"\n{'=' * 60}\n {text}\n{'=' * 60}")
 
-    add("=" * 60)
-    add(" GITHUB WORKFLOW VARIABLE AUDIT")
-    add("=" * 60)
+    def h2(text):
+        lines.append(f"\n--- {text} ---")
 
-    # 1. Per File Breakdown
-    for filename, refs in auditor.results.items():
-        if not refs["secrets"] and not refs["vars"]:
-            continue
-        add(f"\n📄 File: {filename}")
-        if refs["vars"]:
-            add(f"   [vars]    : {', '.join(sorted(refs['vars']))}")
-        if refs["secrets"]:
-            add(f"   [secrets] : {', '.join(sorted(refs['secrets']))}")
+    def line(text):
+        lines.append(text)
 
-    # 2. Global Summary
-    add("\n" + "=" * 60)
-    add(" GLOBAL USAGE SUMMARY (Required by YML files)")
-    add("=" * 60)
+    h1("GITHUB WORKFLOW CONFIG AUDIT")
 
-    req_vars = sorted(auditor.global_usage["vars"])
-    req_secrets = sorted(auditor.global_usage["secrets"])
+    # 1. Global Summary
+    req_vars = sorted(scanner.global_usage["vars"])
+    req_secrets = sorted(scanner.global_usage["secrets"])
 
-    add(f"Total Unique Vars Needed:    {len(req_vars)}")
-    add(f"Total Unique Secrets Needed: {len(req_secrets)}")
-    add("-" * 30)
+    line(f"Total Unique Vars Found:    {len(req_vars)}")
+    line(f"Total Unique Secrets Found: {len(req_secrets)}")
+
+    def get_status(name, kind, repo_set, env_map):
+        if not gh_data:
+            return ""
+
+        # Check Repo Level
+        if name in repo_set:
+            return " [✅ Repo]"
+
+        # Check Env Level
+        found_envs = [e for e, data in env_map.items() if name in data[kind]]
+        if found_envs:
+            return f" [⚠️  Envs: {', '.join(found_envs)}]"
+
+        if name == "GITHUB_TOKEN" and kind == "secrets":
+            return " [🤖 Auto]"
+
+        return " [❌ MISSING]"
 
     if req_vars:
-        add("VARS used:")
+        h2("VARIABLES (vars.*)")
         for v in req_vars:
-            status = ""
-            if gh_data and v not in gh_data["repo_vars"]:
-                # Check envs if not in repo
-                found_in_env = [e for e, d in gh_data["envs"].items() if v in d["vars"]]
-                if found_in_env:
-                    status = f" (Found in Envs: {', '.join(found_in_env)})"
-                else:
-                    status = " ❌ [MISSING in Repo]"
-            elif gh_data:
-                status = " ✅ [Defined in Repo]"
-            add(f"  - vars.{v}{status}")
+            status = get_status(
+                v,
+                "vars",
+                gh_data.get("repo_vars", set()) if gh_data else set(),
+                gh_data.get("envs", {}) if gh_data else {},
+            )
+            line(f"  - {v:<30}{status}")
 
     if req_secrets:
-        add("\nSECRETS used:")
+        h2("SECRETS (secrets.*)")
         for s in req_secrets:
-            if s == "GITHUB_TOKEN":
-                add(f"  - secrets.{s} (Automatic)")
-                continue
-
-            status = ""
-            if gh_data and s not in gh_data["repo_secrets"]:
-                found_in_env = [
-                    e for e, d in gh_data["envs"].items() if s in d["secrets"]
-                ]
-                if found_in_env:
-                    status = f" (Found in Envs: {', '.join(found_in_env)})"
-                else:
-                    status = " ❌ [MISSING in Repo]"
-            elif gh_data:
-                status = " ✅ [Defined in Repo]"
-            add(f"  - secrets.{s}{status}")
-
-    # 3. Unused definitions (Bonus)
-    if gh_data:
-        add("\n" + "=" * 60)
-        add(" UNUSED DEFINITIONS (Defined in GitHub but not in scanned YML)")
-        add("=" * 60)
-        unused_vars = gh_data["repo_vars"] - set(req_vars)
-        unused_secrets = gh_data["repo_secrets"] - set(req_secrets)
-
-        if unused_vars:
-            add(f"Unused Repo Vars: {', '.join(unused_vars)}")
-        if unused_secrets:
-            add(f"Unused Repo Secrets: {', '.join(unused_secrets)}")
-
-    # Write to file
-    if output_file:
-        try:
-            with open(output_file, "w") as f:
-                f.write("\n".join(lines))
-            print(f"\n💾 Summary written to: {output_file}")
-        except Exception as e:
-            print(f"\nCould not write output file: {e}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Extract vars and secrets from GitHub Workflows"
-    )
-    parser.add_argument("path", help="Path to .yml file or folder containing workflows")
-    parser.add_argument(
-        "--repo",
-        help="GitHub repo (format: owner/repo) to check existence",
-        default=None,
-    )
-    parser.add_argument(
-        "--token",
-        help="GitHub PAT (optional if using --repo, defaults to env GITHUB_TOKEN)",
-        default=None,
-    )
-    parser.add_argument("--out", help="Output text file path", default=None)
-
-    args = parser.parse_args()
-
-    # 1. Scan Files
-    auditor = WorkflowAuditor()
-    auditor.scan_path(args.path)
-
-    # 2. Fetch GitHub Data (if requested)
-    gh_data = None
-    if args.repo:
-        token = args.token or os.getenv("GITHUB_TOKEN")
-        if not token:
-            print(
-                "Error: --repo specified but no token found. Use --token or set GITHUB_TOKEN env var."
+            status = get_status(
+                s,
+                "secrets",
+                gh_data.get("repo_secrets", set()) if gh_data else set(),
+                gh_data.get("envs", {}) if gh_data else {},
             )
-            sys.exit(1)
-        connector = GithubConnector(token, args.repo)
-        gh_data = connector.fetch_definitions()
+            line(f"  - {s:<30}{status}")
 
-    # 3. Report
-    generate_report(auditor, gh_data, args.out)
+    # 2. File Detail
+    h2("USAGE BY FILE")
+    for fname, refs in scanner.results.items():
+        line(f"📄 {fname}")
+        if refs["vars"]:
+            line(f"   vars    : {', '.join(sorted(refs['vars']))}")
+        if refs["secrets"]:
+            line(f"   secrets : {', '.join(sorted(refs['secrets']))}")
+
+    # 3. Unused (Bonus)
+    if gh_data:
+        h2("UNUSED REPO DEFINITIONS")
+        unused_v = gh_data["repo_vars"] - set(req_vars)
+        unused_s = gh_data["repo_secrets"] - set(req_secrets)
+
+        if unused_v:
+            line(f"Unused Repo Vars:    {', '.join(sorted(unused_v))}")
+        if unused_s:
+            line(f"Unused Repo Secrets: {', '.join(sorted(unused_s))}")
+        if not unused_v and not unused_s:
+            line("All repo-level definitions are used in the scanned files.")
+
+    return "\n".join(lines)
+
+
+# --- CLI ENTRY POINT ---
+
+
+@click.command()
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--check-gh",
+    is_flag=True,
+    help="Fetch definitions from GitHub to compare existence.",
+)
+@click.option(
+    "--repo",
+    default=None,
+    help="Target GitHub repo (owner/repo). Default: current git remote.",
+)
+@click.option("--out", type=click.Path(), help="Write summary to this text file.")
+def cli(path, check_gh, repo, out):
+    """
+    Scans GitHub Workflow YAML files in PATH to find 'vars.*' and 'secrets.*'.
+
+    PATH can be a single .yml file or a directory (recursive scan).
+    """
+
+    # 1. Scan Local Files
+    scanner = WorkflowScanner()
+    scanner.scan_path(path)
+
+    if not scanner.results:
+        click.secho("No variables or secrets found in the specified path.", fg="yellow")
+        return
+
+    # 2. Fetch GitHub Data (Optional)
+    gh_data = None
+    if check_gh:
+        try:
+            inspector = GHInspector(repo)
+            gh_data = inspector.fetch_data()
+        except click.ClickException as e:
+            click.secho(str(e), fg="red")
+            sys.exit(1)
+
+    # 3. Generate Report
+    report_text = generate_output(scanner, gh_data)
+
+    # 4. Print to Stdout (with colors for status)
+    # We print the raw report, but let's colorize specific markers if printing to terminal
+    for line in report_text.split("\n"):
+        if "[❌ MISSING]" in line:
+            click.secho(line, fg="red")
+        elif "[✅ Repo]" in line:
+            click.secho(line, fg="green")
+        elif "[⚠️" in line:
+            click.secho(line, fg="yellow")
+        elif line.startswith("="):
+            click.secho(line, bold=True)
+        else:
+            click.echo(line)
+
+    # 5. Write to File
+    if out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(report_text)
+            click.secho(f"\n💾 Report saved to: {out}", fg="blue")
+        except Exception as e:
+            click.secho(f"Error writing file: {e}", fg="red")
 
 
 if __name__ == "__main__":
-    main()
+    cli()
