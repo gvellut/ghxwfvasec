@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import click
 import yaml
@@ -14,7 +14,7 @@ import yaml
 
 class WorkflowScanner:
     def __init__(self):
-        # Regex to catch: secrets.NAME, vars.NAME, ${{ secrets.NAME }}
+        # Regex to catch: secrets.NAME, vars.NAME
         self.pattern = re.compile(r"\b(secrets|vars)\.([a-zA-Z0-9_-]+)\b")
         self.results = {}
         self.global_usage = {"secrets": set(), "vars": set()}
@@ -46,12 +46,10 @@ class WorkflowScanner:
             file_refs = {"secrets": set(), "vars": set()}
             self._walk_node(data, file_refs)
 
-            # Only store if something was found
             if file_refs["secrets"] or file_refs["vars"]:
                 self.results[file_path.name] = file_refs
 
         except Exception:
-            # Ignore invalid yaml or read errors
             pass
 
     def scan_path(self, path: Path) -> None:
@@ -70,12 +68,14 @@ class WorkflowScanner:
 
 
 class GHInspector:
-    def __init__(self, repo: str = None):
+    def __init__(self, repo: Optional[str] = None):
         if not shutil.which("gh"):
             raise click.ClickException(
                 "GitHub CLI ('gh') not found. Please install it."
             )
 
+        self.repo_str = repo
+        # -R is valid for 'gh secret ...' commands but NOT 'gh api'
         self.repo_arg = ["-R", repo] if repo else []
         self._check_auth()
 
@@ -88,6 +88,7 @@ class GHInspector:
             )
 
     def _run_json(self, cmd: List[str]) -> Any:
+        # Helper for standard gh commands (secret list, etc) which support -R
         full_cmd = ["gh"] + cmd + self.repo_arg + ["--json", "name"]
         try:
             res = subprocess.run(full_cmd, capture_output=True, text=True, check=True)
@@ -98,33 +99,47 @@ class GHInspector:
     def fetch_data(self):
         click.echo("🔄 Fetching definitions from GitHub...")
 
-        # Repo level
+        # 1. Fetch Repo Level
         repo_secrets = set(x["name"] for x in self._run_json(["secret", "list"]))
         repo_vars = set(x["name"] for x in self._run_json(["variable", "list"]))
 
-        # Environment level
-        envs = {}
-        # Fetch env list via API
-        api_cmd = (
-            ["gh", "api"]
-            + self.repo_arg
-            + ["repos/:owner/:repo/environments", "--jq", ".environments[].name"]
-        )
-        res = subprocess.run(api_cmd, capture_output=True, text=True)
+        # 2. Fetch Environment List
+        # FIX: Construct the endpoint manually to avoid passing -R to gh api
+        if self.repo_str:
+            endpoint = f"repos/{self.repo_str}/environments"
+        else:
+            # Use gh magic placeholders for current dir context
+            endpoint = "repos/:owner/:repo/environments"
 
-        if res.returncode == 0 and res.stdout.strip():
-            env_names = res.stdout.strip().split("\n")
-            for env in env_names:
-                if not env:
-                    continue
-                e_secrets = set(
-                    x["name"] for x in self._run_json(["secret", "list", "--env", env])
-                )
-                e_vars = set(
-                    x["name"]
-                    for x in self._run_json(["variable", "list", "--env", env])
-                )
-                envs[env] = {"secrets": e_secrets, "vars": e_vars}
+        api_cmd = ["gh", "api", endpoint, "--jq", ".environments[].name"]
+
+        envs = {}
+        try:
+            res = subprocess.run(api_cmd, capture_output=True, text=True, check=True)
+            env_names = res.stdout.strip().split("\n") if res.stdout.strip() else []
+        except subprocess.CalledProcessError as e:
+            click.secho(
+                f"Warning: Failed to fetch environments via API: {e.stderr}",
+                fg="yellow",
+            )
+            env_names = []
+
+        # 3. Fetch Details per Environment
+        if env_names:
+            with click.progressbar(env_names, label="Fetching Envs") as bar:
+                for env in bar:
+                    if not env:
+                        continue
+                    # Note: "secret list" DOES support self.repo_arg
+                    e_secrets = set(
+                        x["name"]
+                        for x in self._run_json(["secret", "list", "--env", env])
+                    )
+                    e_vars = set(
+                        x["name"]
+                        for x in self._run_json(["variable", "list", "--env", env])
+                    )
+                    envs[env] = {"secrets": e_secrets, "vars": e_vars}
 
         return {"repo_secrets": repo_secrets, "repo_vars": repo_vars, "envs": envs}
 
@@ -133,7 +148,6 @@ class GHInspector:
 
 
 def generate_output(scanner, gh_data):
-    """Generates a list of strings for the report."""
     lines = []
 
     def h1(text):
@@ -147,47 +161,44 @@ def generate_output(scanner, gh_data):
 
     h1("GITHUB WORKFLOW CONFIG AUDIT")
 
-    # 1. Global Summary
     req_vars = sorted(scanner.global_usage["vars"])
     req_secrets = sorted(scanner.global_usage["secrets"])
 
     line(f"Total Unique Vars Found:    {len(req_vars)}")
     line(f"Total Unique Secrets Found: {len(req_secrets)}")
 
-    # Prepare available environment names
     available_envs = (
         sorted(gh_data["envs"].keys()) if gh_data and "envs" in gh_data else []
     )
 
     def analyze_item(name, kind, repo_set, env_map):
-        """
-        Returns a dictionary of status strings for Repo and every Environment.
-        """
         if not gh_data:
             return None
 
         status_map = {}
 
-        # 1. Check Repo Level (Base)
+        # 1. Check Repo Level
         is_in_repo = name in repo_set
+
+        # Special case: GITHUB_TOKEN is auto-generated
         if name == "GITHUB_TOKEN" and kind == "secrets":
             status_map["Repo"] = " [🤖 Auto]"
-            # If auto, assume available everywhere
             for env in available_envs:
                 status_map[env] = " [🤖 Auto]"
             return status_map
 
         status_map["Repo"] = " [✅ Repo]" if is_in_repo else " [❌ MISSING]"
 
-        # 2. Check Environment Level
+        # 2. Check Env Level
         for env_name in available_envs:
             env_data = env_map.get(env_name, {}).get(kind, set())
             is_in_env = name in env_data
 
             if is_in_env:
-                status_map[env_name] = " [✅ Env]"  # Defined specifically in Env
+                status_map[env_name] = " [✅ Env]"
             elif is_in_repo:
-                status_map[env_name] = " [✅ Inherited]"  # Fallback to Repo
+                # GitHub Actions inherits repo secrets if not overridden
+                status_map[env_name] = " [✅ Inherited]"
             else:
                 status_map[env_name] = " [❌ MISSING]"
 
@@ -202,23 +213,16 @@ def generate_output(scanner, gh_data):
 
         for item in items:
             line(f"  • {item}")
-
-            # Analyze availability
             status_map = analyze_item(item, kind, repo_set, env_map)
 
             if status_map:
-                # Print Repo Status
                 line(f"    |__ {'(Actions)':<15} {status_map['Repo']}")
-
-                # Print Env Statuses
                 if available_envs:
                     for env in available_envs:
                         line(f"    |__ {env:<15} {status_map[env]}")
             else:
-                # No GH data check
                 line("    (No GitHub data fetched)")
 
-    # REPORT VARIABLES
     print_section(
         "VARIABLES (vars.*)",
         req_vars,
@@ -226,7 +230,6 @@ def generate_output(scanner, gh_data):
         gh_data.get("repo_vars", set()) if gh_data else set(),
     )
 
-    # REPORT SECRETS
     print_section(
         "SECRETS (secrets.*)",
         req_secrets,
@@ -234,7 +237,6 @@ def generate_output(scanner, gh_data):
         gh_data.get("repo_secrets", set()) if gh_data else set(),
     )
 
-    # 2. File Detail
     h2("USAGE BY FILE")
     for fname, refs in scanner.results.items():
         line(f"📄 {fname}")
@@ -251,32 +253,20 @@ def generate_output(scanner, gh_data):
 
 @click.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
-@click.option(
-    "--check-gh",
-    is_flag=True,
-    help="Fetch definitions from GitHub to compare existence.",
-)
-@click.option(
-    "--repo",
-    default=None,
-    help="Target GitHub repo (owner/repo). Default: current git remote.",
-)
-@click.option("--out", type=click.Path(), help="Write summary to this text file.")
+@click.option("--check-gh", is_flag=True, help="Fetch definitions from GitHub.")
+@click.option("--repo", default=None, help="Target GitHub repo (owner/repo).")
+@click.option("--out", type=click.Path(), help="Write summary to file.")
 def cli(path, check_gh, repo, out):
     """
-    Scans GitHub Workflow YAML files in PATH to find 'vars.*' and 'secrets.*'.
-    Detailed breakdown by Repository and Environments.
+    Scans GitHub Workflow YAML files and audits against GitHub Repo/Env definitions.
     """
-
-    # 1. Scan Local Files
     scanner = WorkflowScanner()
     scanner.scan_path(path)
 
     if not scanner.results:
-        click.secho("No variables or secrets found in the specified path.", fg="yellow")
+        click.secho("No variables or secrets found in path.", fg="yellow")
         return
 
-    # 2. Fetch GitHub Data (Optional)
     gh_data = None
     if check_gh:
         try:
@@ -286,13 +276,10 @@ def cli(path, check_gh, repo, out):
             click.secho(str(e), fg="red")
             sys.exit(1)
 
-    # 3. Generate Report
     report_text = generate_output(scanner, gh_data)
 
-    # 4. Print to Stdout (with colors)
-    # The formatting relies on identifying the status tags in the strings.
+    # Print with color parsing
     for line in report_text.split("\n"):
-        # Determine color based on status tags present in the line
         color = None
         if "[❌ MISSING]" in line:
             color = "red"
@@ -311,7 +298,6 @@ def cli(path, check_gh, repo, out):
             click.secho(line, bold=True, fg="yellow")
             continue
         elif line.strip().startswith("•"):
-            # The variable name itself
             click.secho(line, bold=True)
             continue
 
@@ -320,14 +306,10 @@ def cli(path, check_gh, repo, out):
         else:
             click.echo(line)
 
-    # 5. Write to File
     if out:
-        try:
-            with open(out, "w", encoding="utf-8") as f:
-                f.write(report_text)
-            click.secho(f"\n💾 Report saved to: {out}", fg="blue")
-        except Exception as e:
-            click.secho(f"Error writing file: {e}", fg="red")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(report_text)
+        click.secho(f"\n💾 Report saved to: {out}", fg="blue")
 
 
 if __name__ == "__main__":
