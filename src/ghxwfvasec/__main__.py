@@ -4,10 +4,13 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 import yaml
+
+# Constant for the "Actions" (repo-level) environment filter
+ACTIONS_ENV = "actions"
 
 # --- SCANNER LOGIC ---
 
@@ -147,7 +150,16 @@ class GHInspector:
 # --- REPORTING ---
 
 
-def generate_output(scanner, gh_data):
+def generate_output(scanner, gh_data, filter_envs: Optional[Tuple[str, ...]] = None):
+    """
+    Generate the audit report.
+
+    Args:
+        scanner: The workflow scanner with results
+        gh_data: GitHub data (repo/env secrets and vars)
+        filter_envs: Optional tuple of environment names to filter by.
+                     Use ACTIONS_ENV constant for repo-level.
+    """
     lines = []
 
     def h1(text):
@@ -170,6 +182,13 @@ def generate_output(scanner, gh_data):
     available_envs = (
         sorted(gh_data["envs"].keys()) if gh_data and "envs" in gh_data else []
     )
+
+    # Determine which environments to show
+    show_actions = filter_envs is None or ACTIONS_ENV in filter_envs
+    if filter_envs is None:
+        envs_to_show = available_envs
+    else:
+        envs_to_show = [e for e in available_envs if e in filter_envs]
 
     def analyze_item(name, kind, repo_set, env_map):
         if not gh_data:
@@ -216,9 +235,10 @@ def generate_output(scanner, gh_data):
             status_map = analyze_item(item, kind, repo_set, env_map)
 
             if status_map:
-                line(f"    |__ {'(Actions)':<15} {status_map['Repo']}")
-                if available_envs:
-                    for env in available_envs:
+                if show_actions:
+                    line(f"    |__ {'(Actions)':<15} {status_map['Repo']}")
+                if envs_to_show:
+                    for env in envs_to_show:
                         line(f"    |__ {env:<15} {status_map[env]}")
             else:
                 line("    (No GitHub data fetched)")
@@ -256,7 +276,14 @@ def generate_output(scanner, gh_data):
 @click.option("--check-gh", is_flag=True, help="Fetch definitions from GitHub.")
 @click.option("--repo", default=None, help="Target GitHub repo (owner/repo).")
 @click.option("--out", type=click.Path(), help="Write summary to file.")
-def cli(path, check_gh, repo, out):
+@click.option(
+    "--env",
+    "-e",
+    "envs",
+    multiple=True,
+    help=f"Filter output by environment. Use '{ACTIONS_ENV}' for repo-level, or an environment name. Can be specified multiple times.",
+)
+def cli(path, check_gh, repo, out, envs):
     """
     Scans GitHub Workflow YAML files and audits against GitHub Repo/Env definitions.
     """
@@ -276,7 +303,21 @@ def cli(path, check_gh, repo, out):
             click.secho(str(e), fg="red")
             sys.exit(1)
 
-    report_text = generate_output(scanner, gh_data)
+    # Validate requested environments
+    filter_envs = envs if envs else None
+    if filter_envs and gh_data:
+        available_envs = set(gh_data.get("envs", {}).keys())
+        valid_envs = available_envs | {ACTIONS_ENV}
+        for env in filter_envs:
+            if env not in valid_envs:
+                click.secho(
+                    f"Error: Environment '{env}' does not exist. "
+                    f"Available: {ACTIONS_ENV}, {', '.join(sorted(available_envs))}",
+                    fg="red",
+                )
+                sys.exit(1)
+
+    report_text = generate_output(scanner, gh_data, filter_envs)
 
     # Print with color parsing
     for line in report_text.split("\n"):
