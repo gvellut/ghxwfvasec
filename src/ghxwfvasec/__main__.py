@@ -154,45 +154,85 @@ def generate_output(scanner, gh_data):
     line(f"Total Unique Vars Found:    {len(req_vars)}")
     line(f"Total Unique Secrets Found: {len(req_secrets)}")
 
-    def get_status(name, kind, repo_set, env_map):
+    # Prepare available environment names
+    available_envs = (
+        sorted(gh_data["envs"].keys()) if gh_data and "envs" in gh_data else []
+    )
+
+    def analyze_item(name, kind, repo_set, env_map):
+        """
+        Returns a dictionary of status strings for Repo and every Environment.
+        """
         if not gh_data:
-            return ""
+            return None
 
-        # Check Repo Level
-        if name in repo_set:
-            return " [✅ Repo]"
+        status_map = {}
 
-        # Check Env Level
-        found_envs = [e for e, data in env_map.items() if name in data[kind]]
-        if found_envs:
-            return f" [⚠️  Envs: {', '.join(found_envs)}]"
-
+        # 1. Check Repo Level (Base)
+        is_in_repo = name in repo_set
         if name == "GITHUB_TOKEN" and kind == "secrets":
-            return " [🤖 Auto]"
+            status_map["Repo"] = " [🤖 Auto]"
+            # If auto, assume available everywhere
+            for env in available_envs:
+                status_map[env] = " [🤖 Auto]"
+            return status_map
 
-        return " [❌ MISSING]"
+        status_map["Repo"] = " [✅ Repo]" if is_in_repo else " [❌ MISSING]"
 
-    if req_vars:
-        h2("VARIABLES (vars.*)")
-        for v in req_vars:
-            status = get_status(
-                v,
-                "vars",
-                gh_data.get("repo_vars", set()) if gh_data else set(),
-                gh_data.get("envs", {}) if gh_data else {},
-            )
-            line(f"  - {v:<30}{status}")
+        # 2. Check Environment Level
+        for env_name in available_envs:
+            env_data = env_map.get(env_name, {}).get(kind, set())
+            is_in_env = name in env_data
 
-    if req_secrets:
-        h2("SECRETS (secrets.*)")
-        for s in req_secrets:
-            status = get_status(
-                s,
-                "secrets",
-                gh_data.get("repo_secrets", set()) if gh_data else set(),
-                gh_data.get("envs", {}) if gh_data else {},
-            )
-            line(f"  - {s:<30}{status}")
+            if is_in_env:
+                status_map[env_name] = " [✅ Env]"  # Defined specifically in Env
+            elif is_in_repo:
+                status_map[env_name] = " [✅ Inherited]"  # Fallback to Repo
+            else:
+                status_map[env_name] = " [❌ MISSING]"
+
+        return status_map
+
+    def print_section(title, items, kind, repo_set):
+        if not items:
+            return
+        h2(title)
+
+        env_map = gh_data.get("envs", {}) if gh_data else {}
+
+        for item in items:
+            line(f"  • {item}")
+
+            # Analyze availability
+            status_map = analyze_item(item, kind, repo_set, env_map)
+
+            if status_map:
+                # Print Repo Status
+                line(f"    |__ {'(Actions)':<15} {status_map['Repo']}")
+
+                # Print Env Statuses
+                if available_envs:
+                    for env in available_envs:
+                        line(f"    |__ {env:<15} {status_map[env]}")
+            else:
+                # No GH data check
+                line("    (No GitHub data fetched)")
+
+    # REPORT VARIABLES
+    print_section(
+        "VARIABLES (vars.*)",
+        req_vars,
+        "vars",
+        gh_data.get("repo_vars", set()) if gh_data else set(),
+    )
+
+    # REPORT SECRETS
+    print_section(
+        "SECRETS (secrets.*)",
+        req_secrets,
+        "secrets",
+        gh_data.get("repo_secrets", set()) if gh_data else set(),
+    )
 
     # 2. File Detail
     h2("USAGE BY FILE")
@@ -202,19 +242,6 @@ def generate_output(scanner, gh_data):
             line(f"   vars    : {', '.join(sorted(refs['vars']))}")
         if refs["secrets"]:
             line(f"   secrets : {', '.join(sorted(refs['secrets']))}")
-
-    # 3. Unused (Bonus)
-    if gh_data:
-        h2("UNUSED REPO DEFINITIONS")
-        unused_v = gh_data["repo_vars"] - set(req_vars)
-        unused_s = gh_data["repo_secrets"] - set(req_secrets)
-
-        if unused_v:
-            line(f"Unused Repo Vars:    {', '.join(sorted(unused_v))}")
-        if unused_s:
-            line(f"Unused Repo Secrets: {', '.join(sorted(unused_s))}")
-        if not unused_v and not unused_s:
-            line("All repo-level definitions are used in the scanned files.")
 
     return "\n".join(lines)
 
@@ -238,8 +265,7 @@ def generate_output(scanner, gh_data):
 def cli(path, check_gh, repo, out):
     """
     Scans GitHub Workflow YAML files in PATH to find 'vars.*' and 'secrets.*'.
-
-    PATH can be a single .yml file or a directory (recursive scan).
+    Detailed breakdown by Repository and Environments.
     """
 
     # 1. Scan Local Files
@@ -263,17 +289,34 @@ def cli(path, check_gh, repo, out):
     # 3. Generate Report
     report_text = generate_output(scanner, gh_data)
 
-    # 4. Print to Stdout (with colors for status)
-    # We print the raw report, but let's colorize specific markers if printing to terminal
+    # 4. Print to Stdout (with colors)
+    # The formatting relies on identifying the status tags in the strings.
     for line in report_text.split("\n"):
+        # Determine color based on status tags present in the line
+        color = None
         if "[❌ MISSING]" in line:
-            click.secho(line, fg="red")
+            color = "red"
+        elif "[✅ Env]" in line:
+            color = "cyan"
+        elif "[✅ Inherited]" in line:
+            color = "green"
         elif "[✅ Repo]" in line:
-            click.secho(line, fg="green")
-        elif "[⚠️" in line:
-            click.secho(line, fg="yellow")
+            color = "green"
+        elif "[🤖 Auto]" in line:
+            color = "blue"
         elif line.startswith("="):
             click.secho(line, bold=True)
+            continue
+        elif line.startswith("---"):
+            click.secho(line, bold=True, fg="yellow")
+            continue
+        elif line.strip().startswith("•"):
+            # The variable name itself
+            click.secho(line, bold=True)
+            continue
+
+        if color:
+            click.secho(line, fg=color)
         else:
             click.echo(line)
 
