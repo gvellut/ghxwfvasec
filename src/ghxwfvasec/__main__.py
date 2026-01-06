@@ -283,7 +283,7 @@ def generate_output(scanner, gh_data, filter_envs: Optional[Tuple[str, ...]] = N
     multiple=True,
     help=f"Filter output by environment. Use '{ACTIONS_ENV}' for repo-level, or an environment name. Can be specified multiple times.",
 )
-def cli(path, check_gh, repo, out, envs):
+def main(path, check_gh, repo, out, envs):
     """
     Scans GitHub Workflow YAML files and audits against GitHub Repo/Env definitions.
     """
@@ -354,4 +354,4 @@ def cli(path, check_gh, repo, out, envs):
 
 
 if __name__ == "__main__":
-    cli()
+    main()

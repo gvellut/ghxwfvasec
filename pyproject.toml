@@ -1,17 +1,14 @@
 [project]
 name = "ghxwfvasec"
 version = "0.1.0"
-description = "Add your description here"
+description = "Extract secrets/vars references from GitHub Actions workflows and audit them against repo/environment definitions"
 readme = "README.md"
 authors = [{ name = "Guilhem Vellut", email = "guilhem.vellut@gmail.com" }]
 requires-python = ">=3.13"
-dependencies = [
-    "click>=8.3.1",
-    "pyyaml>=6.0.3",
-]
+dependencies = ["click>=8.3.1", "pyyaml>=6.0.3"]
 
 [project.scripts]
-ghxwfvasec = "ghxwfvasec.__main___:main"
+ghxwfvasec = "ghxwfvasec.__main__:main"
 
 [build-system]
 requires = ["uv_build>=0.9.17,<0.10.0"]
