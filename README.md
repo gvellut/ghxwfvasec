@@ -6,7 +6,7 @@ It scans GitHub Actions workflow YAML files and extracts references to:
 - `vars.NAME`
 - `secrets.NAME`
 
-Optionally (with `--check-gh`), it uses the GitHub CLI (`gh`) to fetch the repo-level and environment-level variables/secrets that exist in GitHub and reports which referenced names are missing or inherited.
+By default (`--auto` mode), it uses the GitHub CLI (`gh`) to fetch the repo-level and environment-level variables/secrets that exist in GitHub and reports which referenced names are missing or inherited.
 
 ## Install (local)
 
@@ -24,16 +24,33 @@ Refer to [the `gh` doc](https://cli.github.com/manual/) for installation and set
 
 ## Usage
 
-Scan workflow files under a directory (or a single file):
+By default, the tool runs in `--auto` mode which:
+- Uses `.github/workflows` as the default path if none is provided
+- Auto-detects the Github repository from the current git directory
+- Enables `--check-gh` to fetch GitHub definitions
+
+Simply run from a repository root:
+
+```bash
+uv run ghxwfvasec
+```
+
+Or specify a path explicitly:
 
 ```bash
 uv run ghxwfvasec .github/workflows
 ```
 
-Audit against GitHub (requires `gh` installed and authenticated with `gh auth login`):
+To disable auto-detection and GitHub checking:
 
 ```bash
-uv run ghxwfvasec .github/workflows --check-gh --repo owner/repo
+uv run ghxwfvasec .github/workflows --no-auto --no-check-gh
+```
+
+Override the auto-detected repo:
+
+```bash
+uv run ghxwfvasec --repo owner/repo
 ```
 
 Filter the report to specific environments:
