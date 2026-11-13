@@ -1,0 +1,3 @@
+Move the current command to "project" sub command.
+Crate an "account" subcommand : I want for each project in the account used by the gh command : the list of var / secrets used in the workflow (same scope as the current ocmmand : ie environment, or action env vars / secrets). Have an -a flag : to display the project with sthing like "No envar or secret" if there is none. Without the flag : do not show the project if no envar/secret. Have an option "match" (multi value possible) : will output only the vars / secrets names that match (the value must be a substring of the name). If multiple : OR so match any.  Print the output similar to what is now. also have a --out option.
+You can move each ocmmand in a separate file wiht the __main__ just assembling / initializing.
